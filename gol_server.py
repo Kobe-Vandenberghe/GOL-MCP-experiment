@@ -39,7 +39,7 @@ from gol_world import (
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_ADVANCE = 100          # per user spec: cap generations per advance() call
 MAX_OBSERVE_CELLS = 20000  # cap ASCII output size for observe_world
-MAX_FPS = 90.0
+MAX_FPS = 120.0
 MIN_FPS = 0.5
 HISTORY_SNAPSHOT_INTERVAL = 10
 HISTORY_MAX_SNAPSHOTS = 2000
@@ -219,12 +219,18 @@ async def rewind_world(target_generation: int, actor: str) -> str:
         grid = S._reconstruct_generation_locked(target)
         S.world.grid = grid
         S.world.generation = target
+        # Committing a rewind establishes a new present on a linear timeline.
+        # Any generations ahead of the target are discarded immediately.
+        dropped = S._truncate_future_locked()
         S._record_snapshot_locked(force=True)
         pop = S.world.population()
 
     await broadcast_state()
-    await log_event(actor, f"rewind_to_generation({target}) -> pop {pop}")
-    return f"Moved world from generation {current} to {target}. Population is now {pop}."
+    await log_event(actor, f"rewind_to_generation({target}) -> pop {pop}, dropped {dropped} future snapshots")
+    return (
+        f"Moved world from generation {current} to {target}. Population is now {pop}. "
+        f"Dropped {dropped} future snapshots from the timeline."
+    )
 
 
 # ------------------------------------------------------------------ MCP tools
@@ -416,7 +422,7 @@ async def advance(generations: int = 1) -> str:
 @mcp.tool()
 async def set_autorun(enabled: bool, fps: float = 10) -> str:
     """Start or stop continuous simulation on the server (the user watches it
-    run live). fps is generations per second, clamped to 0.5..90. All other
+    run live). fps is generations per second, clamped to 0.5..120. All other
     tools keep working while it runs - observe_world to peek, set_cells to
     interfere. Remember to stop it when the show is over."""
     await set_running(enabled, fps)

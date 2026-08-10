@@ -70,7 +70,7 @@ url = "http://localhost:8000/mcp"
 | `advance(generations)` | Step the simulation, 1–100 per call, animated in the browser |
 | `advance_generations(count, sample_every)` | Efficiently commit up to thousands of generations in one call, returning compact per-sample stats (not the full board) plus a run summary |
 | `preview_generations(count, sample_every)` | Same as `advance_generations` but doesn't touch the world — test what would happen before committing |
-| `set_autorun(enabled, fps)` | Continuous simulation on the server, 0.5–90 gen/s |
+| `set_autorun(enabled, fps)` | Continuous simulation on the server, 0.5–120 gen/s |
 
 Coordinates everywhere: `(x, y)`, 0-indexed, `(0,0)` top-left, x → right,
 y ↓ down.

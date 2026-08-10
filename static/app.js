@@ -27,6 +27,7 @@ let rewindSendTimer = null;
 const preview = { active: false, generation: 0, population: 0, cells: null };
 let previewRequestSeq = 0;
 let latestPreviewRequested = 0;
+let pendingRewindGeneration = null;
 
 const pack = (r, g, b) => ((0xff << 24) | (b << 16) | (g << 8) | r) >>> 0;
 const DEAD = pack(0x10, 0x16, 0x1e);
@@ -52,6 +53,12 @@ function connect() {
 }
 const send = (obj) => { if (wsOk) ws.send(JSON.stringify(obj)); };
 
+function formatFps(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0";
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
 function updateRewindButtonState() {
   const gen = Number(timeline.value);
   btnRewind.disabled = !Number.isInteger(gen) || gen === st.generation;
@@ -73,6 +80,10 @@ function applyState(m) {
                       cells: m.cells,
                       timelineLatestGeneration: m.timeline_latest_generation ?? m.generation });
 
+  if (pendingRewindGeneration !== null && st.generation === pendingRewindGeneration) {
+    pendingRewindGeneration = null;
+  }
+
   if (preview.active && (st.running || st.generation !== preview.generation)) {
     clearPreview();
   }
@@ -87,7 +98,7 @@ function applyState(m) {
   btnPlay.classList.toggle("active", st.running);
   if (document.activeElement !== slider) {
     slider.value = st.fps;
-    fpsLabel.textContent = Math.round(st.fps);
+    fpsLabel.textContent = formatFps(st.fps);
   }
   timeline.min = String(st.timelineMin);
   timeline.max = String(Math.max(st.generation, st.timelineLatestGeneration));
@@ -108,6 +119,7 @@ function renderCells(cellsB64, aliveColor) {
 }
 
 function applyPreview(m) {
+  if (pendingRewindGeneration !== null) return;
   if (typeof m.request_id === "number" && m.request_id < latestPreviewRequested) return;
 
   preview.active = true;
@@ -125,12 +137,14 @@ function applyPreview(m) {
   draw();
 }
 
-function clearPreview() {
+function clearPreview(keepSelection = false) {
   if (!preview.active) return;
   preview.active = false;
   preview.cells = null;
-  timeline.value = String(st.generation);
-  timelineLabel.textContent = timeline.value;
+  if (!keepSelection) {
+    timeline.value = String(st.generation);
+    timelineLabel.textContent = timeline.value;
+  }
   updateRewindButtonState();
   elGen.textContent = st.generation;
   elPop.textContent = st.population;
@@ -307,7 +321,7 @@ $("btn-clear").onclick = () => {
 };
 $("btn-fit").onclick = () => { fit(); draw(); };
 slider.oninput = () => {
-  fpsLabel.textContent = slider.value;
+  fpsLabel.textContent = formatFps(slider.value);
   send({ action: "fps", fps: +slider.value });
 };
 
@@ -327,7 +341,13 @@ timeline.onchange = () => {
 btnRewind.onclick = () => {
   const gen = Number(timeline.value);
   if (!Number.isInteger(gen) || gen === st.generation) return;
-  clearPreview();
+  timelineDragging = false;
+  timeline.value = String(gen);
+  timelineLabel.textContent = timeline.value;
+  previewRequestSeq += 1;
+  latestPreviewRequested = previewRequestSeq;
+  pendingRewindGeneration = gen;
+  clearPreview(true);
   send({ action: "rewind", generation: gen });
 };
 
