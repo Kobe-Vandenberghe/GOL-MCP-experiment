@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import bisect
 import json
 import time
 from collections import deque
@@ -29,6 +30,7 @@ from gol_world import (
     MIN_DIM,
     SimulationError,
     World,
+    next_grid_of,
     parse_rle,
     simulate,
     validate_sim_params,
@@ -37,8 +39,19 @@ from gol_world import (
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_ADVANCE = 100          # per user spec: cap generations per advance() call
 MAX_OBSERVE_CELLS = 20000  # cap ASCII output size for observe_world
-MAX_FPS = 90.0
-MIN_FPS = 0.5
+MAX_FPS = 1000.0
+MIN_FPS = 1.0
+HISTORY_SNAPSHOT_INTERVAL = 10
+HISTORY_MAX_SNAPSHOTS = 2000
+
+
+def _pack_grid(grid: np.ndarray) -> bytes:
+    return np.packbits(grid, axis=None).tobytes()
+
+
+def _unpack_grid(packed: bytes, width: int, height: int) -> np.ndarray:
+    bits = np.unpackbits(np.frombuffer(packed, dtype=np.uint8), count=width * height)
+    return bits.reshape((height, width)).astype(np.uint8, copy=False)
 
 
 class State:
@@ -50,6 +63,64 @@ class State:
         self.running = False
         self.fps = 10.0
         self.run_task: asyncio.Task | None = None
+        self.snapshot_interval = HISTORY_SNAPSHOT_INTERVAL
+        self.history_generations: list[int] = []
+        self.history_snapshots: dict[int, bytes] = {}
+        self.max_reachable_generation = 0
+        self._reset_history_locked()
+
+    def _reset_history_locked(self) -> None:
+        self.history_generations.clear()
+        self.history_snapshots.clear()
+        self.max_reachable_generation = self.world.generation
+        self._record_snapshot_locked(force=True)
+
+    def _record_snapshot_locked(self, force: bool = False) -> bool:
+        gen = self.world.generation
+        if not force and (gen % self.snapshot_interval != 0):
+            return False
+
+        if gen not in self.history_snapshots:
+            bisect.insort(self.history_generations, gen)
+        self.history_snapshots[gen] = _pack_grid(self.world.grid)
+        if gen > self.max_reachable_generation:
+            self.max_reachable_generation = gen
+
+        while len(self.history_generations) > HISTORY_MAX_SNAPSHOTS:
+            drop_gen = self.history_generations.pop(0)
+            if drop_gen == gen and self.history_generations:
+                drop_gen = self.history_generations.pop(0)
+            self.history_snapshots.pop(drop_gen, None)
+        return True
+
+    def _truncate_future_locked(self) -> int:
+        idx = bisect.bisect_right(self.history_generations, self.world.generation)
+        to_drop = self.history_generations[idx:]
+        if not to_drop:
+            return 0
+        del self.history_generations[idx:]
+        for gen in to_drop:
+            self.history_snapshots.pop(gen, None)
+        self.max_reachable_generation = self.world.generation
+        return len(to_drop)
+
+    def _timeline_bounds_locked(self) -> tuple[int, int]:
+        if not self.history_generations:
+            return self.world.generation, self.world.generation
+        return self.history_generations[0], self.history_generations[-1]
+
+    def _reconstruct_generation_locked(self, target_generation: int) -> np.ndarray:
+        idx = bisect.bisect_right(self.history_generations, target_generation) - 1
+        if idx < 0:
+            raise ValueError("target generation is older than retained history")
+
+        start_gen = self.history_generations[idx]
+        packed = self.history_snapshots[start_gen]
+        g = _unpack_grid(packed, self.world.width, self.world.height)
+        steps = target_generation - start_gen
+        for _ in range(steps):
+            g = next_grid_of(g, self.world.edge)
+        return g
 
 
 S = State()
@@ -59,6 +130,7 @@ S = State()
 
 def state_message() -> dict:
     w = S.world
+    min_gen, latest_snapshot = S._timeline_bounds_locked()
     return {
         "type": "state",
         "width": w.width,
@@ -68,6 +140,11 @@ def state_message() -> dict:
         "population": w.population(),
         "running": S.running,
         "fps": S.fps,
+        "timeline_min_generation": min_gen,
+        "timeline_latest_snapshot": latest_snapshot,
+        "timeline_latest_generation": S.max_reachable_generation,
+        "timeline_snapshot_interval": S.snapshot_interval,
+        "timeline_snapshot_count": len(S.history_generations),
         "cells": base64.b64encode(np.packbits(w.grid, axis=None).tobytes()).decode("ascii"),
     }
 
@@ -104,7 +181,9 @@ async def _run_loop() -> None:
         while S.running:
             t0 = time.monotonic()
             async with S.lock:
+                S._truncate_future_locked()
                 S.world.step(1)
+                S._record_snapshot_locked()
             await broadcast_state()
             delay = 1.0 / S.fps - (time.monotonic() - t0)
             await asyncio.sleep(delay if delay > 0 else 0.001)
@@ -122,6 +201,36 @@ async def set_running(running: bool, fps: float | None = None) -> None:
     elif not running:
         S.running = False  # loop exits on its own and broadcasts
     await broadcast_state()
+
+
+async def rewind_world(target_generation: int, actor: str) -> str:
+    target = int(target_generation)
+    await set_running(False)
+    async with S.lock:
+        current = S.world.generation
+        if target < 0:
+            raise ValueError("generation must be >= 0")
+        if target > S.max_reachable_generation:
+            raise ValueError(
+                f"generation {target} is outside retained history "
+                f"(max reachable is {S.max_reachable_generation})"
+            )
+
+        grid = S._reconstruct_generation_locked(target)
+        S.world.grid = grid
+        S.world.generation = target
+        # Committing a rewind establishes a new present on a linear timeline.
+        # Any generations ahead of the target are discarded immediately.
+        dropped = S._truncate_future_locked()
+        S._record_snapshot_locked(force=True)
+        pop = S.world.population()
+
+    await broadcast_state()
+    await log_event(actor, f"rewind_to_generation({target}) -> pop {pop}, dropped {dropped} future snapshots")
+    return (
+        f"Moved world from generation {current} to {target}. Population is now {pop}. "
+        f"Dropped {dropped} future snapshots from the timeline."
+    )
 
 
 # ------------------------------------------------------------------ MCP tools
@@ -176,6 +285,7 @@ async def create_world(width: int, height: int, edge: str = "wrap", random_fill:
         raise ValueError("random_fill must be between 0 and 1")
     async with S.lock:
         S.world = World(width, height, edge=edge, random_fill=random_fill)
+        S._reset_history_locked()
         pop = S.world.population()
     await broadcast_state()
     fill_txt = f", random_fill={random_fill}" if random_fill else ""
@@ -189,6 +299,7 @@ async def clear_world() -> str:
     Dimensions and edge behavior are kept."""
     async with S.lock:
         S.world.clear()
+        S._reset_history_locked()
         w, h = S.world.width, S.world.height
     await broadcast_state()
     await log_event("agent", "clear_world")
@@ -230,8 +341,10 @@ async def set_cells(alive: list[list[int]] | None = None, dead: list[list[int]] 
     if not alive and not dead:
         raise ValueError("pass at least one of alive/dead as a list of [x, y] pairs")
     async with S.lock:
+        S._truncate_future_locked()
         n_alive, skip_a = S.world.set_cells(alive, 1)
         n_dead, skip_d = S.world.set_cells(dead, 0)
+        S._record_snapshot_locked(force=True)
         pop = S.world.population()
     await broadcast_state()
     await log_event("agent", f"set_cells +{n_alive} alive, +{n_dead} dead -> pop {pop}")
@@ -257,11 +370,13 @@ async def place_pattern(rle: str, x: int, y: int, clear_rect: bool = False) -> s
     rectangle first, so the pattern lands on a clean area."""
     cells, pw, ph = parse_rle(rle)
     async with S.lock:
+        S._truncate_future_locked()
         w = S.world
         if clear_rect:
             rect = [(x + dx, y + dy) for dy in range(ph) for dx in range(pw)]
             w.set_cells(rect, 0)
         placed, skipped = w.set_cells([(x + dx, y + dy) for dx, dy in cells], 1)
+        S._record_snapshot_locked(force=True)
         pop = w.population()
     await broadcast_state()
     await log_event("agent", f"place_pattern {pw}x{ph} ({placed} cells) at ({x},{y})")
@@ -284,10 +399,12 @@ async def advance(generations: int = 1) -> str:
     if not 1 <= n <= MAX_ADVANCE:
         raise ValueError(f"generations must be between 1 and {MAX_ADVANCE}")
     async with S.lock:
+        S._truncate_future_locked()
         pop_before = S.world.population()
     for i in range(n):
         async with S.lock:
             S.world.step(1)
+            S._record_snapshot_locked(force=(i == n - 1))
         await broadcast_state()
         if n > 1:
             await asyncio.sleep(0.01)  # let viewers see the animation
@@ -305,7 +422,7 @@ async def advance(generations: int = 1) -> str:
 @mcp.tool()
 async def set_autorun(enabled: bool, fps: float = 10) -> str:
     """Start or stop continuous simulation on the server (the user watches it
-    run live). fps is generations per second, clamped to 0.5..90. All other
+    run live). fps is generations per second, clamped to 1..1000. All other
     tools keep working while it runs - observe_world to peek, set_cells to
     interfere. Remember to stop it when the show is over."""
     await set_running(enabled, fps)
@@ -325,6 +442,40 @@ def _sim_summary_text(summary: dict) -> str:
     if summary["repeating_period"]:
         bits.append(f"period {summary['repeating_period']}")
     return ", ".join(bits)
+
+
+def _timeline_status_text() -> str:
+    current = S.world.generation
+    min_gen, latest_snapshot = S._timeline_bounds_locked()
+    max_gen = S.max_reachable_generation
+    return (
+        f"Timeline status\n"
+        f"Current generation: {current}\n"
+        f"Earliest retained snapshot: {min_gen}\n"
+        f"Latest retained snapshot: {latest_snapshot}\n"
+        f"Latest reachable generation: {max_gen}\n"
+        f"Snapshot interval target: every {S.snapshot_interval} generations\n"
+        f"Stored snapshots: {len(S.history_generations)} (cap {HISTORY_MAX_SNAPSHOTS})\n"
+        f"Rewind range right now: [{min_gen}..{max_gen}]"
+    )
+
+
+@mcp.tool()
+async def get_timeline_status() -> str:
+    """Inspect rewind history: current generation, retained snapshot range,
+    snapshot interval, and how many snapshots are stored."""
+    async with S.lock:
+        text = _timeline_status_text()
+    await log_event("agent", "get_timeline_status")
+    return text
+
+
+@mcp.tool()
+async def rewind_to_generation(generation: int) -> str:
+    """Rewind the shared world to an earlier generation on the current
+    timeline. If you continue simulating after rewinding, future history is
+    discarded (linear timeline, no branching yet)."""
+    return await rewind_world(generation, actor="agent")
 
 
 @mcp.tool()
@@ -362,6 +513,7 @@ async def advance_generations(count: int, sample_every: int = 1) -> str:
     updated once per sample point (and thus every generation if you pick
     sample_every=1)."""
     async with S.lock:
+        S._truncate_future_locked()
         start_grid = S.world.grid.copy()
         edge = S.world.edge
         start_gen = S.world.generation
@@ -385,8 +537,12 @@ async def advance_generations(count: int, sample_every: int = 1) -> str:
         async with S.lock:
             S.world.grid = g
             S.world.generation = sample["generation"]
+            S._record_snapshot_locked(force=(sample["generation"] == summary["end_generation"] if summary else False))
         await broadcast_state()
         await asyncio.sleep(0)
+
+    async with S.lock:
+        S._record_snapshot_locked(force=True)
 
     await log_event(
         "agent",
@@ -473,7 +629,9 @@ async def _handle_ui(msg: dict) -> None:
         cells = msg.get("cells") or []
         value = 1 if msg.get("value", 1) else 0
         async with S.lock:
+            S._truncate_future_locked()
             S.world.set_cells(cells, value)
+            S._record_snapshot_locked(force=True)
         await broadcast_state()
     elif action == "play":
         await set_running(True, msg.get("fps"))
@@ -483,8 +641,27 @@ async def _handle_ui(msg: dict) -> None:
         await log_event("user", "pressed pause")
     elif action == "step":
         async with S.lock:
+            S._truncate_future_locked()
             S.world.step(1)
+            S._record_snapshot_locked(force=True)
         await broadcast_state()
+    elif action == "advance":
+        try:
+            n = int(msg.get("generations", 1))
+            if not 1 <= n <= MAX_ADVANCE:
+                raise ValueError(f"generations must be between 1 and {MAX_ADVANCE}")
+            async with S.lock:
+                S._truncate_future_locked()
+            for i in range(n):
+                async with S.lock:
+                    S.world.step(1)
+                    S._record_snapshot_locked(force=(i == n - 1))
+                await broadcast_state()
+                if n > 1:
+                    await asyncio.sleep(0.01)
+            await log_event("user", f"advanced {n} generations")
+        except Exception as e:
+            await log_event("user", f"advance failed: {e}")
     elif action == "fps":
         fps = msg.get("fps")
         if fps:
@@ -493,8 +670,68 @@ async def _handle_ui(msg: dict) -> None:
     elif action == "clear":
         async with S.lock:
             S.world.clear()
+            S._reset_history_locked()
         await broadcast_state()
         await log_event("user", "cleared the world")
+    elif action == "create":
+        try:
+            width = int(msg.get("width"))
+            height = int(msg.get("height"))
+            edge = str(msg.get("edge", "wrap"))
+            random_fill = float(msg.get("random_fill", 0.0))
+            if edge not in ("wrap", "dead"):
+                raise ValueError('edge must be "wrap" or "dead"')
+            if not 0.0 <= random_fill <= 1.0:
+                raise ValueError("random_fill must be between 0 and 1")
+
+            async with S.lock:
+                S.world = World(width, height, edge=edge, random_fill=random_fill)
+                S._reset_history_locked()
+                pop = S.world.population()
+
+            await broadcast_state()
+            fill_txt = f", random_fill={random_fill}" if random_fill else ""
+            await log_event("user", f"create_world {width}x{height} edge={edge}{fill_txt} -> pop {pop}")
+        except Exception as e:
+            await log_event("user", f"create failed: {e}")
+    elif action == "rewind":
+        try:
+            target = int(msg.get("generation"))
+            await rewind_world(target, actor="user")
+        except Exception as e:
+            await log_event("user", f"rewind failed: {e}")
+
+
+async def _handle_ui_for_socket(ws: WebSocket, msg: dict) -> None:
+    action = msg.get("action")
+    if action != "preview_generation":
+        await _handle_ui(msg)
+        return
+
+    try:
+        target = int(msg.get("generation"))
+    except Exception:
+        return
+    req_id = msg.get("request_id")
+
+    async with S.lock:
+        if target < 0 or target > S.max_reachable_generation:
+            return
+        g = S._reconstruct_generation_locked(target)
+        pop = int(g.sum())
+        payload = {
+            "type": "preview_state",
+            "generation": target,
+            "population": pop,
+            "cells": base64.b64encode(np.packbits(g, axis=None).tobytes()).decode("ascii"),
+        }
+        if isinstance(req_id, int):
+            payload["request_id"] = req_id
+
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception:
+        pass
 
 
 @app.websocket("/ws")
@@ -509,7 +746,7 @@ async def ws_endpoint(ws: WebSocket):
                 msg = json.loads(await ws.receive_text())
             except json.JSONDecodeError:
                 continue
-            await _handle_ui(msg)
+            await _handle_ui_for_socket(ws, msg)
     except WebSocketDisconnect:
         pass
     finally:
