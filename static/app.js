@@ -11,7 +11,12 @@ const elGen = $("stat-gen"), elPop = $("stat-pop"), elSize = $("stat-size"),
       elCursor = $("stat-cursor"), elConn = $("conn"),
       btnPlay = $("btn-play"), slider = $("fps"), fpsLabel = $("fps-label"),
   timeline = $("timeline"), timelineLabel = $("timeline-label"),
-  btnRewind = $("btn-rewind"), eventsBox = $("events");
+  btnRewind = $("btn-rewind"), eventsBox = $("events"),
+  createWidth = $("create-width"), createHeight = $("create-height"),
+  createEdge = $("create-edge"), createRandom = $("create-random"),
+  btnCreate = $("btn-create"), advanceGenerations = $("advance-generations"),
+  btnAdvance = $("btn-advance"), leftPanel = document.querySelector(".left-panel"),
+  leftResizer = $("left-resizer");
 
 // ------------------------------------------------------------------- state
 const st = { width: 0, height: 0, generation: 0, population: 0,
@@ -319,6 +324,22 @@ $("btn-clear").onclick = () => {
   clearPreview();
   send({ action: "clear" });
 };
+btnCreate.onclick = () => {
+  clearPreview();
+  const width = Number(createWidth.value);
+  const height = Number(createHeight.value);
+  const randomFill = Number(createRandom.value);
+  const edge = createEdge.value === "dead" ? "dead" : "wrap";
+  if (!Number.isInteger(width) || !Number.isInteger(height)) return;
+  if (!Number.isFinite(randomFill)) return;
+  send({ action: "create", width, height, edge, random_fill: randomFill });
+};
+btnAdvance.onclick = () => {
+  clearPreview();
+  const generations = Number(advanceGenerations.value);
+  if (!Number.isInteger(generations) || generations < 1 || generations > 100) return;
+  send({ action: "advance", generations });
+};
 $("btn-fit").onclick = () => { fit(); draw(); };
 slider.oninput = () => {
   fpsLabel.textContent = formatFps(slider.value);
@@ -365,6 +386,22 @@ $("mcp-cmd").onclick = () => {
   $("mcp-cmd").style.color = "#7ce38b";
   setTimeout(() => ($("mcp-cmd").style.color = ""), 500);
 };
+
+if (leftResizer && leftPanel) {
+  let resizeDrag = null;
+  leftResizer.addEventListener("pointerdown", (e) => {
+    resizeDrag = { startX: e.clientX, startWidth: leftPanel.getBoundingClientRect().width };
+    leftResizer.setPointerCapture(e.pointerId);
+  });
+  leftResizer.addEventListener("pointermove", (e) => {
+    if (!resizeDrag) return;
+    const next = Math.max(220, Math.min(520, Math.round(resizeDrag.startWidth + (e.clientX - resizeDrag.startX))));
+    document.documentElement.style.setProperty("--left-panel-width", `${next}px`);
+  });
+  const stopResize = () => { resizeDrag = null; };
+  leftResizer.addEventListener("pointerup", stopResize);
+  leftResizer.addEventListener("pointercancel", stopResize);
+}
 
 window.addEventListener("resize", () => { if (!view.fitted) fit(); draw(); });
 

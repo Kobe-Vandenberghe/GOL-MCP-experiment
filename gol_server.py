@@ -39,8 +39,8 @@ from gol_world import (
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_ADVANCE = 100          # per user spec: cap generations per advance() call
 MAX_OBSERVE_CELLS = 20000  # cap ASCII output size for observe_world
-MAX_FPS = 120.0
-MIN_FPS = 0.5
+MAX_FPS = 1000.0
+MIN_FPS = 1.0
 HISTORY_SNAPSHOT_INTERVAL = 10
 HISTORY_MAX_SNAPSHOTS = 2000
 
@@ -422,7 +422,7 @@ async def advance(generations: int = 1) -> str:
 @mcp.tool()
 async def set_autorun(enabled: bool, fps: float = 10) -> str:
     """Start or stop continuous simulation on the server (the user watches it
-    run live). fps is generations per second, clamped to 0.5..120. All other
+    run live). fps is generations per second, clamped to 1..1000. All other
     tools keep working while it runs - observe_world to peek, set_cells to
     interfere. Remember to stop it when the show is over."""
     await set_running(enabled, fps)
@@ -645,6 +645,23 @@ async def _handle_ui(msg: dict) -> None:
             S.world.step(1)
             S._record_snapshot_locked(force=True)
         await broadcast_state()
+    elif action == "advance":
+        try:
+            n = int(msg.get("generations", 1))
+            if not 1 <= n <= MAX_ADVANCE:
+                raise ValueError(f"generations must be between 1 and {MAX_ADVANCE}")
+            async with S.lock:
+                S._truncate_future_locked()
+            for i in range(n):
+                async with S.lock:
+                    S.world.step(1)
+                    S._record_snapshot_locked(force=(i == n - 1))
+                await broadcast_state()
+                if n > 1:
+                    await asyncio.sleep(0.01)
+            await log_event("user", f"advanced {n} generations")
+        except Exception as e:
+            await log_event("user", f"advance failed: {e}")
     elif action == "fps":
         fps = msg.get("fps")
         if fps:
@@ -656,6 +673,27 @@ async def _handle_ui(msg: dict) -> None:
             S._reset_history_locked()
         await broadcast_state()
         await log_event("user", "cleared the world")
+    elif action == "create":
+        try:
+            width = int(msg.get("width"))
+            height = int(msg.get("height"))
+            edge = str(msg.get("edge", "wrap"))
+            random_fill = float(msg.get("random_fill", 0.0))
+            if edge not in ("wrap", "dead"):
+                raise ValueError('edge must be "wrap" or "dead"')
+            if not 0.0 <= random_fill <= 1.0:
+                raise ValueError("random_fill must be between 0 and 1")
+
+            async with S.lock:
+                S.world = World(width, height, edge=edge, random_fill=random_fill)
+                S._reset_history_locked()
+                pop = S.world.population()
+
+            await broadcast_state()
+            fill_txt = f", random_fill={random_fill}" if random_fill else ""
+            await log_event("user", f"create_world {width}x{height} edge={edge}{fill_txt} -> pop {pop}")
+        except Exception as e:
+            await log_event("user", f"create failed: {e}")
     elif action == "rewind":
         try:
             target = int(msg.get("generation"))
