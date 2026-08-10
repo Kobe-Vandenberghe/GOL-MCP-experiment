@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Game of Life &middot; MCP</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230b0e13'/><rect x='3' y='3' width='4' height='4' fill='%237ce38b'/><rect x='9' y='6' width='4' height='4' fill='%237ce38b'/><rect x='5' y='10' width='4' height='4' fill='%232e7d4f'/></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">LIFE<span>&middot;</span>MCP</div>
+  <div class="stats">
+    <span>gen <b id="stat-gen">0</b></span>
+    <span>pop <b id="stat-pop">0</b></span>
+    <span id="stat-size">&mdash;</span>
+    <span id="stat-cursor"></span>
+  </div>
+  <div class="controls">
+    <button id="btn-play">&#9654; Play</button>
+    <button id="btn-step">Step</button>
+    <label class="speed">speed <input id="fps" type="range" min="1" max="90" value="10"><span id="fps-label">10</span>/s</label>
+    <span class="modes">
+      <button id="mode-draw" class="active" title="left-drag paints live cells, right-drag erases">Draw</button>
+      <button id="mode-erase" title="left-drag erases cells">Erase</button>
+      <button id="mode-pan" title="left-drag pans; wheel always zooms">Pan</button>
+    </span>
+    <button id="btn-fit" title="fit board to window">Fit</button>
+    <button id="btn-clear" class="danger" title="kill all cells">Clear</button>
+    <span id="conn" class="conn" title="server connection">&#9679;</span>
+  </div>
+</header>
+<main>
+  <canvas id="view"></canvas>
+  <aside>
+    <h2>Activity</h2>
+    <div id="events"><div class="evt-empty">Waiting for agent activity&hellip;</div></div>
+    <div class="hint">
+      Agents connect via MCP (click to copy):
+      <code id="mcp-cmd" title="click to copy">claude mcp add --transport http gol http://localhost:8000/mcp</code>
+    </div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
