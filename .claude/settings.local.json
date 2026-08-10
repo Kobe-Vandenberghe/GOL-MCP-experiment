@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(.venv/Scripts/python.exe -c ' *)",
-      "mcp__gol__create_world"
-    ]
-  }
-}

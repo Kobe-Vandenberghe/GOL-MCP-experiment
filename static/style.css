@@ -36,6 +36,11 @@ button.danger:hover { background: #6d2626; border-color: #a03535; }
 input[type="range"] { width: 90px; accent-color: #7ce38b; }
 #fps-label { min-width: 2ch; text-align: right; color: #e6edf3; }
 
+.timeline { display: flex; align-items: center; gap: 6px; color: #8b98a9; white-space: nowrap; }
+#timeline { width: 140px; }
+#timeline-label { min-width: 4ch; text-align: right; color: #e6edf3; font-variant-numeric: tabular-nums; }
+#btn-rewind:disabled { opacity: 0.55; cursor: default; }
+
 .conn { font-size: 15px; color: #e05555; }
 .conn.ok { color: #7ce38b; }
 
