@@ -63,8 +63,21 @@ def test_index_is_served(client):
 
 
 def test_static_assets_are_served(client):
-    for path in ("/static/app.js", "/static/style.css", "/static/index.html"):
+    for path in ("/static/style.css", "/static/index.html"):
         assert client.get(path).status_code == 200, path
+
+
+def test_every_browser_module_is_served(client):
+    """The viewer loads as ES modules, so a missing or renamed file is a blank
+    page rather than a 404 the user would notice."""
+    for name in ("main", "store", "renderer", "socket", "controls"):
+        r = client.get(f"/static/js/{name}.js")
+        assert r.status_code == 200, name
+
+
+def test_the_page_loads_the_module_entry_point(client):
+    body = client.get("/").text
+    assert '<script type="module" src="/static/js/main.js"></script>' in body
 
 
 def test_mcp_endpoint_lists_the_tools(client):

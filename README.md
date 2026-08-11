@@ -177,7 +177,7 @@ own snapshot, never commits, and can never be interrupted.
 | `mcp_tools.py` | The 12 MCP tool definitions. Mostly docstrings — they are the agent's contract. |
 | `ws.py` | Browser command protocol and the WebSocket endpoint. |
 | `app.py` | Composition root: wires it together into one FastAPI app. |
-| `static/` | The browser viewer (vanilla JS + canvas). |
+| `static/` | The browser viewer: `index.html`, `style.css`, and `js/` — plain ES modules (`store`, `renderer`, `socket`, `controls`, `main`), no build step. |
 | `tests/` | pytest suite (see above). |
 
 The dependency order is one-way: `gol_world` ← `world_service` ←
