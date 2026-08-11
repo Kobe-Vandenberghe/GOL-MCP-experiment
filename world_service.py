@@ -63,6 +63,7 @@ class WorldStatus:
     dynamics: str
     running: bool
     fps: float
+    revision: int
 
 
 @dataclass(frozen=True)
@@ -145,14 +146,24 @@ class TimelineStatus:
 class SimulationRun:
     """Result of advance_generations / preview_generations.
 
-    `error` is set instead of samples/summary when the requested parameters
-    exceed a cap — callers surface it as a structured object rather than
-    raising, so an agent can read the suggested limit and retry.
+    Three outcomes, distinguished by `error` and `interrupted`:
+
+    - `error` set: the parameters exceeded a cap. Surfaced as a structured
+      object rather than raised, so an agent can read the suggested limit and
+      retry. `samples` is empty and nothing was committed.
+    - `interrupted` set: something else modified the world mid-run, so the
+      operation stopped at `interrupted_at_generation`. `samples` holds
+      everything that did commit; `summary` is None, because the generator
+      never ran to completion and a summary covering the requested range
+      would describe generations that were never reached.
+    - neither: the run completed and `summary` covers the whole range.
     """
     samples: list[dict] = field(default_factory=list)
     summary: dict | None = None
     error: dict | None = None
     committed: bool = False
+    interrupted: bool = False
+    interrupted_at_generation: int | None = None
 
     @property
     def failed(self) -> bool:
@@ -218,8 +229,16 @@ class WorldService:
         self.history_generations: list[int] = []
         self.history_snapshots: dict[int, bytes] = {}
         self.max_reachable_generation = 0
+        # Incremented by every mutation. A long-running operation records the
+        # revision it expects and re-checks it before each commit, so it can
+        # tell "the world I am building on" from "somebody else changed it".
+        self.revision = 0
         self._on_change = on_change
         self._reset_history_locked()
+
+    def _bump_locked(self) -> int:
+        self.revision += 1
+        return self.revision
 
     def set_change_listener(self, on_change: Callable[[], Awaitable[None]] | None) -> None:
         self._on_change = on_change
@@ -315,7 +334,7 @@ class WorldService:
                 width=w.width, height=w.height, edge=w.edge,
                 generation=w.generation, population=w.population(),
                 bbox=w.bounding_box(), dynamics=w.dynamics(),
-                running=self.running, fps=self.fps,
+                running=self.running, fps=self.fps, revision=self.revision,
             )
 
     async def timeline_status(self) -> TimelineStatus:
@@ -371,6 +390,7 @@ class WorldService:
         async with self.lock:
             self.world = World(width, height, edge=edge, random_fill=random_fill)
             self._reset_history_locked()
+            self._bump_locked()
             result = CreateResult(
                 width=self.world.width, height=self.world.height, edge=self.world.edge,
                 random_fill=random_fill, population=self.world.population(),
@@ -382,6 +402,7 @@ class WorldService:
         async with self.lock:
             self.world.clear()
             self._reset_history_locked()
+            self._bump_locked()
             result = ClearResult(width=self.world.width, height=self.world.height)
         await self._changed()
         return result
@@ -398,6 +419,7 @@ class WorldService:
             n_alive, skip_a = self.world.set_cells(alive, 1)
             n_dead, skip_d = self.world.set_cells(dead, 0)
             self._record_snapshot_locked(force=True)
+            self._bump_locked()
             result = SetCellsResult(
                 set_alive=n_alive, set_dead=n_dead, skipped=skip_a + skip_d,
                 population=self.world.population(),
@@ -419,6 +441,7 @@ class WorldService:
                 )
             placed, skipped = w.set_cells([(x + dx, y + dy) for dx, dy in cells], 1)
             self._record_snapshot_locked(force=True)
+            self._bump_locked()
             result = PlacementResult(
                 pattern_width=pw, pattern_height=ph, x=x, y=y,
                 placed_cells=placed, skipped=skipped,
@@ -443,6 +466,7 @@ class WorldService:
             async with self.lock:
                 self.world.step(1)
                 self._record_snapshot_locked(force=(i == n - 1))
+                self._bump_locked()
             await self._changed()
             if n > 1:
                 await asyncio.sleep(0.01)  # let viewers see the animation
@@ -473,6 +497,7 @@ class WorldService:
             # timeline; anything ahead of the target is discarded immediately.
             dropped = self._truncate_future_locked()
             self._record_snapshot_locked(force=True)
+            self._bump_locked()
             result = RewindResult(
                 from_generation=current, to_generation=target,
                 population=self.world.population(), dropped_snapshots=dropped,
@@ -490,6 +515,7 @@ class WorldService:
                     self._truncate_future_locked()
                     self.world.step(1)
                     self._record_snapshot_locked()
+                    self._bump_locked()
                 await self._changed()
                 delay = 1.0 / self.fps - (time.monotonic() - t0)
                 await asyncio.sleep(delay if delay > 0 else 0.001)
@@ -526,10 +552,18 @@ class WorldService:
 
     async def advance_generations(self, count: int, sample_every: int = 1) -> SimulationRun:
         """Simulate and PERMANENTLY commit `count` generations, broadcasting
-        once per sample so the browser keeps animating."""
+        once per sample so the browser keeps animating.
+
+        The run is derived from a snapshot taken at the start, so it stops as
+        soon as anything else writes to the world: continuing would overwrite
+        that write with generations computed from a board that no longer
+        exists. Everything committed up to that point is kept and returned —
+        the caller can simply ask for the remainder.
+        """
         async with self.lock:
             self._truncate_future_locked()
             start_grid, edge, start_gen, cell_count = self._sim_setup_locked()
+            expected_revision = self.revision
 
         try:
             validate_sim_params(count, sample_every, cell_count)
@@ -539,14 +573,20 @@ class WorldService:
         samples: list[dict] = []
         it = simulate(start_grid, edge, count, sample_every, start_gen)
         summary = None
+        interrupted = False
+        last_committed = start_gen
         while True:
             try:
                 sample, g = next(it)
             except StopIteration as stop:
                 summary = stop.value["summary"]
                 break
-            samples.append(sample)
             async with self.lock:
+                if self.revision != expected_revision:
+                    # Someone else wrote to the world while we were computing.
+                    # Stop rather than clobber them with a stale board.
+                    interrupted = True
+                    break
                 # .copy() is load-bearing: simulate() yields its own live
                 # working array, so assigning it directly would alias the
                 # world's grid onto simulator internals. World.set_cells/clear
@@ -556,8 +596,19 @@ class WorldService:
                 self.world.grid = g.copy()
                 self.world.generation = sample["generation"]
                 self._record_snapshot_locked()
+                expected_revision = self._bump_locked()
+            samples.append(sample)
+            last_committed = sample["generation"]
             await self._changed()
             await asyncio.sleep(0)
+
+        it.close()
+
+        if interrupted:
+            return SimulationRun(
+                samples=samples, summary=None, committed=bool(samples),
+                interrupted=True, interrupted_at_generation=last_committed,
+            )
 
         async with self.lock:
             self._record_snapshot_locked(force=True)

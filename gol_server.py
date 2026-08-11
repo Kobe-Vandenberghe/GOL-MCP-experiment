@@ -115,7 +115,8 @@ def _status_text(st: WorldStatus) -> str:
         f"Live-cell bounding box: {box_txt}\n"
         f"Dynamics: {st.dynamics}\n"
         f"Autorun: {'ON at ' + str(st.fps) + ' fps' if st.running else 'off'}\n"
-        f"Connected browser viewers: {len(SOCKETS)}"
+        f"Connected browser viewers: {len(SOCKETS)}\n"
+        f"World revision: {st.revision} (bumped by every change, from any source)"
     )
 
 
@@ -200,7 +201,28 @@ def _sim_summary_text(summary: dict) -> str:
 def _sim_run_json(run: SimulationRun) -> str:
     if run.failed:
         return json.dumps(run.error)
-    return json.dumps({"samples": run.samples, "summary": run.summary})
+    payload = {"samples": run.samples, "summary": run.summary}
+    if run.interrupted:
+        payload["interrupted"] = {
+            "at_generation": run.interrupted_at_generation,
+            "reason": "concurrent_edit",
+            "message": (
+                "Another actor (the browser, or autorun) modified the world "
+                f"mid-run, so this call stopped at generation "
+                f"{run.interrupted_at_generation} instead of completing. The "
+                "generations listed in \"samples\" are committed; \"summary\" "
+                "is null because the run did not finish. Call again to "
+                "continue from the world's current state."
+            ),
+        }
+    return json.dumps(payload)
+
+
+def _sim_interrupted_log(name: str, run: SimulationRun) -> str:
+    return (
+        f"{name} interrupted by a concurrent edit at generation "
+        f"{run.interrupted_at_generation} ({len(run.samples)} generations committed)"
+    )
 
 
 async def rewind_world(target_generation: int, actor: str) -> str:
@@ -396,9 +418,23 @@ async def advance_generations(count: int, sample_every: int = 1) -> str:
     "max_count_for_board": N} tells you the limit for the current board;
     call it repeatedly for more). The browser keeps animating live: it's
     updated once per sample point (and thus every generation if you pick
-    sample_every=1)."""
+    sample_every=1).
+
+    Concurrent edits: the run is computed from a snapshot of the board taken
+    when the call starts, so if anything else writes to the world while it
+    runs (the user drawing in the browser, pressing Clear or Play, or another
+    tool call), this stops early rather than overwriting that change with
+    generations derived from a board that no longer exists. You then get:
+      {"samples": [...], "summary": null,
+       "interrupted": {"at_generation": N, "reason": "concurrent_edit", ...}}
+    The generations in "samples" ARE committed - only the remainder was
+    skipped. "summary" is null because the run never finished, so check for
+    an "interrupted" key before reading "summary". Call again to continue
+    from wherever the world ended up."""
     run = await service.advance_generations(count, sample_every)
-    if not run.failed:
+    if run.interrupted:
+        await log_event("agent", _sim_interrupted_log("advance_generations", run))
+    elif not run.failed:
         await log_event(
             "agent",
             f"advance_generations(count={count}, sample_every={sample_every}) -> "
@@ -418,8 +454,10 @@ async def preview_generations(count: int, sample_every: int = 1) -> str:
     state_hash, shape_hash per sample; extinct/stable/repeating_period
     detection in the summary), and the same structured {"error": ...}
     objects for invalid input - guaranteed to match advance_generations
-    exactly for the same (count, sample_every) since both share the same
-    simulation code. Nothing is committed: call advance_generations
+    exactly for the same (count, sample_every), provided nothing else
+    modifies the world in between, since both walk the same simulation code
+    from the same starting board. Nothing is committed and this can never be
+    interrupted (it works on its own snapshot): call advance_generations
     afterwards if you like what you see."""
     run = await service.preview_generations(count, sample_every)
     if not run.failed:
@@ -486,7 +524,7 @@ async def _handle_ui(msg: dict) -> None:
     elif action == "fps":
         fps = msg.get("fps")
         if fps:
-            await service.set_autorun(service.running, fps)
+            await service.set_autorun(service.running, float(fps))
     elif action == "clear":
         await service.clear()
         await log_event("user", "cleared the world")
@@ -511,7 +549,13 @@ async def _handle_ui(msg: dict) -> None:
 async def _handle_ui_for_socket(ws: WebSocket, msg: dict) -> None:
     action = msg.get("action")
     if action != "preview_generation":
-        await _handle_ui(msg)
+        try:
+            await _handle_ui(msg)
+        except Exception as e:
+            # A malformed command must never take the socket down with it:
+            # ws_endpoint only catches WebSocketDisconnect, so anything else
+            # escaping here would drop the browser's connection.
+            await log_event("user", f"{action or 'command'} failed: {e}")
         return
 
     try:

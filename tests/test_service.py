@@ -80,6 +80,71 @@ async def test_preview_generations_never_notifies_or_commits():
     assert np.array_equal(svc.world.grid, before)
 
 
+# ----------------------------------------------------------- the revision
+
+async def test_revision_starts_at_zero():
+    assert WorldService(World(16, 16)).revision == 0
+
+
+@pytest.mark.parametrize("name,op", [
+    ("create_world", lambda s: s.create_world(24, 24)),
+    ("clear", lambda s: s.clear()),
+    ("set_cells", lambda s: s.set_cells(alive=[[1, 1]])),
+    ("place_pattern", lambda s: s.place_pattern("3o!", 2, 2)),
+    ("advance", lambda s: s.advance(1)),
+])
+async def test_every_mutation_bumps_the_revision(name, op):
+    svc = seeded_service()
+    before = svc.revision
+    await op(svc)
+    assert svc.revision > before, f"{name} did not bump the revision"
+
+
+async def test_advance_bumps_once_per_generation():
+    svc = seeded_service()
+    before = svc.revision
+    await svc.advance(5)
+    assert svc.revision == before + 5
+
+
+async def test_rewind_bumps_the_revision():
+    svc = seeded_service()
+    await svc.advance(10)
+    before = svc.revision
+    await svc.rewind(3)
+    assert svc.revision > before
+
+
+@pytest.mark.parametrize("name,op", [
+    ("status", lambda s: s.status()),
+    ("timeline_status", lambda s: s.timeline_status()),
+    ("observe", lambda s: s.observe()),
+    ("preview_generation", lambda s: s.preview_generation(0)),
+    ("preview_generations", lambda s: s.preview_generations(count=10, sample_every=5)),
+])
+async def test_read_only_operations_do_not_bump_the_revision(name, op):
+    svc = seeded_service()
+    await svc.advance(5)
+    before = svc.revision
+    await op(svc)
+    assert svc.revision == before, f"{name} bumped the revision but changes nothing"
+
+
+async def test_status_reports_the_revision():
+    svc = seeded_service()
+    await svc.advance(3)
+    st = await svc.status()
+    assert st.revision == svc.revision
+
+
+async def test_advance_generations_bumps_once_per_committed_sample():
+    svc = seeded_service()
+    before = svc.revision
+    run = await svc.advance_generations(count=20, sample_every=5)
+    assert not run.interrupted
+    assert svc.revision == before + len(run.samples)
+
+
 # ------------------------------------------------------ structured results
 
 async def test_create_result_reports_the_new_board():

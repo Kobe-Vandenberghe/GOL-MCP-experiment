@@ -101,8 +101,9 @@ Two caps apply, both surfaced as a `{"error": ...}` object in the response
 `advance_generations` commits each sample to the live world as it goes (so
 the browser animates progress at the `sample_every` cadence); `preview_generations`
 never touches the world or the browser. Both walk the identical simulation
-code, so a preview and a subsequent advance with the same arguments always
-agree exactly.
+code, so a preview and a subsequent advance with the same arguments agree
+exactly — provided nothing else edits the world in between (see
+[Concurrent edits](#concurrent-edits)).
 
 ## Browser viewer
 
@@ -137,16 +138,33 @@ from MCP or from the browser. `test_concurrency.py` covers what happens when
 the browser writes to the world while a long `advance_generations` is
 committing to it.
 
-A handful of tests are `xfail(strict=True)` — they document known bugs that
-are not fixed yet, and will start failing loudly (as unexpected passes) once
-they are:
+## Concurrent edits
 
-- `create_world` during `advance_generations` leaves `world.grid` at the old
-  shape while `width`/`height` report the new one, so the broadcast frame is
-  sized from one and packed from the other.
-- `_handle_ui` validates `create`/`rewind` but not `paint`/`fps`, so a
-  malformed WebSocket message escapes to `ws_endpoint` (which only catches
-  `WebSocketDisconnect`) and drops the browser connection.
+Three things can write to the world at once: an MCP tool call, the browser, and
+the autorun loop. Every mutation bumps a `revision` counter (visible in
+`get_world_status`).
+
+`advance_generations` is the only operation that computes from a snapshot and
+commits over many steps, so it is the only one that can be working from a board
+that has since changed underneath it. It re-checks the revision before each
+commit and **stops early** if anything else has written, rather than
+overwriting that change with generations derived from a board that no longer
+exists:
+
+```json
+{"samples": [...], "summary": null,
+ "interrupted": {"at_generation": 1990, "reason": "concurrent_edit", "message": "..."}}
+```
+
+The generations in `samples` are committed — only the remainder is skipped —
+so calling again simply continues from wherever the world ended up. `summary`
+is `null` because the run never finished; check for `interrupted` before
+reading it.
+
+Everything else stays interference-friendly on purpose: `advance` and autorun
+step the live board, so a cell you draw mid-run is picked up by the next
+generation rather than rejected. `preview_generations` works entirely on its
+own snapshot, never commits, and can never be interrupted.
 
 ## Files
 
