@@ -122,8 +122,44 @@ agree exactly.
   find and report the coordinates of every oscillator."
 - "Write my initials using still lifes."
 
+## Tests
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest
+```
+
+`tests/test_world.py`, `test_rle.py` and `test_simulate.py` cover the pure
+simulation layer. `test_history.py` covers snapshot retention, generation
+reconstruction and rewind. `test_service.py` covers `WorldService`'s structured
+results and asserts that each operation behaves identically whether it arrives
+from MCP or from the browser. `test_concurrency.py` covers what happens when
+the browser writes to the world while a long `advance_generations` is
+committing to it.
+
+A handful of tests are `xfail(strict=True)` — they document known bugs that
+are not fixed yet, and will start failing loudly (as unexpected passes) once
+they are:
+
+- `create_world` during `advance_generations` leaves `world.grid` at the old
+  shape while `width`/`height` report the new one, so the broadcast frame is
+  sized from one and packed from the other.
+- `_handle_ui` validates `create`/`rewind` but not `paint`/`fps`, so a
+  malformed WebSocket message escapes to `ws_endpoint` (which only catches
+  `WebSocketDisconnect`) and drops the browser connection.
+
 ## Files
 
-- `gol_server.py` — FastAPI app: WebSocket hub, MCP tools, autorun loop
 - `gol_world.py` — pure simulation: NumPy stepping, RLE parser, ASCII renderer
+- `world_service.py` — authoritative world: state, locking, rewind history,
+  autorun, and every mutating operation. Returns dataclasses, knows nothing
+  about HTTP or WebSockets.
+- `gol_server.py` — transport: FastAPI app, WebSocket hub, MCP tool
+  definitions, and the prose formatting that turns service results into text
+  for the agent.
 - `static/` — the browser viewer (vanilla JS + canvas)
+- `tests/` — pytest suite (see above)
+
+MCP tools and browser commands both call the same `WorldService` methods, so
+each operation has exactly one implementation; only the phrasing of the reply
+and the activity-log line differ.
