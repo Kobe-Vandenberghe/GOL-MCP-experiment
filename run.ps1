@@ -7,4 +7,4 @@ if (-not (Test-Path .venv)) {
 }
 
 Write-Host "Starting Game of Life MCP server on http://localhost:8000"
-& .\.venv\Scripts\python.exe -m uvicorn gol_server:app --host 127.0.0.1 --port 8000
+& .\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000

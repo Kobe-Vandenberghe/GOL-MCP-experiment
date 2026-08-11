@@ -20,7 +20,7 @@ GLIDER = [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]]
 
 
 async def paint(server, cells, value=1):
-    await server._handle_ui({"action": "paint", "cells": cells, "value": value})
+    await server.handle_ui({"action": "paint", "cells": cells, "value": value})
 
 
 def clean_run(width, height, density, seed, count, edge="wrap"):
@@ -260,7 +260,7 @@ async def test_malformed_ui_messages_do_not_escape_the_socket_handler(
     """ws_endpoint only catches WebSocketDisconnect, so anything else escaping
     the handler drops the browser's connection."""
     world_factory()
-    await server._handle_ui_for_socket(None, msg)
+    await server.handle_ui_for_socket(None, msg)
 
 
 @pytest.mark.parametrize("msg", [
@@ -272,9 +272,9 @@ async def test_guarded_ui_actions_swallow_bad_input(server, world_factory, msg):
     """These three already validate; pinned so the behaviour isn't lost when
     validation moves behind a service."""
     world_factory()
-    await server._handle_ui(msg)
+    await server.handle_ui(msg)
 
 
 async def test_an_unknown_action_is_ignored(server, world_factory):
     world_factory()
-    await server._handle_ui({"action": "definitely-not-a-real-action"})
+    await server.handle_ui({"action": "definitely-not-a-real-action"})

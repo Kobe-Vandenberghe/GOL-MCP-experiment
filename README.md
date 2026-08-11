@@ -34,7 +34,7 @@ script, run it as `powershell -ExecutionPolicy Bypass -File run.ps1`.)
 ```powershell
 py -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m uvicorn gol_server:app --host 127.0.0.1 --port 8000
+.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
 ```
 
 Open <http://localhost:8000>. The server binds to localhost only and has no
@@ -168,16 +168,20 @@ own snapshot, never commits, and can never be interrupted.
 
 ## Files
 
-- `gol_world.py` — pure simulation: NumPy stepping, RLE parser, ASCII renderer
-- `world_service.py` — authoritative world: state, locking, rewind history,
-  autorun, and every mutating operation. Returns dataclasses, knows nothing
-  about HTTP or WebSockets.
-- `gol_server.py` — transport: FastAPI app, WebSocket hub, MCP tool
-  definitions, and the prose formatting that turns service results into text
-  for the agent.
-- `static/` — the browser viewer (vanilla JS + canvas)
-- `tests/` — pytest suite (see above)
+| File | Responsibility |
+|---|---|
+| `gol_world.py` | Pure simulation: NumPy stepping, RLE parser, ASCII renderer. No I/O, no async. |
+| `world_service.py` | The authoritative world: state, locking, rewind history, revisions, autorun, and every mutating operation. Returns dataclasses; knows nothing about HTTP or WebSockets. |
+| `formatting.py` | Dataclass → text, for the agent's replies and the activity log. |
+| `hub.py` | Shared transport state: the live service, connected viewers, event log, broadcasting. |
+| `mcp_tools.py` | The 12 MCP tool definitions. Mostly docstrings — they are the agent's contract. |
+| `ws.py` | Browser command protocol and the WebSocket endpoint. |
+| `app.py` | Composition root: wires it together into one FastAPI app. |
+| `static/` | The browser viewer (vanilla JS + canvas). |
+| `tests/` | pytest suite (see above). |
 
-MCP tools and browser commands both call the same `WorldService` methods, so
-each operation has exactly one implementation; only the phrasing of the reply
-and the activity-log line differ.
+The dependency order is one-way: `gol_world` ← `world_service` ←
+`formatting`/`hub` ← `mcp_tools`/`ws` ← `app`. MCP tools and browser commands
+both call the same `WorldService` methods, so each operation has exactly one
+implementation; only the phrasing of the reply and the activity-log line
+differ.

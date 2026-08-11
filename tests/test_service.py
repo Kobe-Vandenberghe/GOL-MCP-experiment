@@ -305,7 +305,7 @@ async def run_both(server, mcp_call, ui_msg, setup=None):
         if which == "mcp":
             await mcp_call()
         else:
-            await server._handle_ui(ui_msg)
+            await server.handle_ui(ui_msg)
         results.append(fingerprint(svc))
     return results
 

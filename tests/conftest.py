@@ -1,8 +1,8 @@
 """Shared fixtures.
 
-gol_server holds a module-level WorldService, so tests that touch the server
-install a fresh one and stub the broadcast/log coroutines that would otherwise
-need a live WebSocket.
+The server surface is split across hub / mcp_tools / ws. The `server` fixture
+presents it as one object so tests read as "call this operation on the running
+server" rather than tracking which module a name currently lives in.
 """
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import gol_server as gs  # noqa: E402
+import formatting  # noqa: E402,F401  (imported so a syntax error here fails fast)
+import hub  # noqa: E402
+import mcp_tools  # noqa: E402
+import ws  # noqa: E402
 from gol_world import World  # noqa: E402
 from world_service import WorldService  # noqa: E402
 
@@ -26,6 +29,30 @@ def seeded_grid(width: int, height: int, density: float, seed: int) -> np.ndarra
     return (rng.random((height, width)) < density).astype(np.uint8)
 
 
+class ServerFacade:
+    """Flat view over hub / mcp_tools / ws.
+
+    `service` is a property so that assigning to it rebinds hub.service, which
+    is what every caller actually reads.
+    """
+
+    _SOURCES = (mcp_tools, ws, hub)
+
+    @property
+    def service(self) -> WorldService:
+        return hub.service
+
+    @service.setter
+    def service(self, value: WorldService) -> None:
+        hub.service = value
+
+    def __getattr__(self, name):
+        for module in self._SOURCES:
+            if hasattr(module, name):
+                return getattr(module, name)
+        raise AttributeError(f"no server attribute {name!r} in hub/mcp_tools/ws")
+
+
 @pytest.fixture
 def service():
     """A bare WorldService with no listener attached."""
@@ -34,22 +61,20 @@ def service():
 
 @pytest.fixture
 def server(monkeypatch):
-    """gol_server wired to a fresh service, with broadcast/log stubbed.
-
-    Yields the module. `server.service` is the WorldService under test.
-    """
+    """The server surface, wired to a fresh service with broadcast/log stubbed
+    so nothing needs a live WebSocket."""
     async def noop(*args, **kwargs):
         return None
 
     fresh = WorldService()
-    monkeypatch.setattr(gs, "service", fresh)
-    monkeypatch.setattr(gs, "broadcast_state", noop)
-    monkeypatch.setattr(gs, "log_event", noop)
-    # The service calls its listener directly, so stubbing the module attribute
+    monkeypatch.setattr(hub, "service", fresh)
+    monkeypatch.setattr(hub, "broadcast_state", noop)
+    monkeypatch.setattr(hub, "log_event", noop)
+    # The service calls its listener directly, so patching the module attribute
     # is not enough — point the listener at the stub too.
     fresh.set_change_listener(noop)
-    yield gs
-    fresh.running = False
+    yield ServerFacade()
+    hub.service.running = False
 
 
 @pytest.fixture
@@ -66,7 +91,7 @@ def world_factory(server):
 
 
 @pytest.fixture
-def commit_hook(server, monkeypatch):
+def commit_hook(server):
     """Run a callback from inside advance_generations' commit loop.
 
     advance_generations awaits its change listener once per committed sample,

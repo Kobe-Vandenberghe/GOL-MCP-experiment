@@ -1,0 +1,124 @@
+def _status_text(st: WorldStatus) -> str:
+    box_txt = (
+        f"x=[{st.bbox[0]}..{st.bbox[2]}] y=[{st.bbox[1]}..{st.bbox[3]}]"
+        if st.bbox else "none (board is empty)"
+    )
+    edge_txt = (
+        "toroidal wrap-around" if st.edge == "wrap"
+        else "cells beyond the border count as dead"
+    )
+    return (
+        f"World {st.width}x{st.height}, edge={st.edge} ({edge_txt})\n"
+        f"Generation {st.generation}, population {st.population}\n"
+        f"Live-cell bounding box: {box_txt}\n"
+        f"Dynamics: {st.dynamics}\n"
+        f"Autorun: {'ON at ' + str(st.fps) + ' fps' if st.running else 'off'}\n"
+        f"Connected browser viewers: {len(SOCKETS)}\n"
+        f"World revision: {st.revision} (bumped by every change, from any source)"
+    )
+
+
+def _timeline_status_text(t: TimelineStatus) -> str:
+    return (
+        f"Timeline status\n"
+        f"Current generation: {t.current_generation}\n"
+        f"Earliest retained snapshot: {t.earliest_snapshot}\n"
+        f"Latest retained snapshot: {t.latest_snapshot}\n"
+        f"Latest reachable generation: {t.max_reachable_generation}\n"
+        f"Snapshot interval target: every {t.snapshot_interval} generations\n"
+        f"Stored snapshots: {t.snapshot_count} (cap {t.snapshot_cap})\n"
+        f"Rewind range right now: [{t.earliest_snapshot}..{t.max_reachable_generation}]"
+    )
+
+
+def _create_text(r: CreateResult) -> str:
+    return (
+        f"Created {r.width}x{r.height} world (edge={r.edge}), "
+        f"generation 0, population {r.population}."
+    )
+
+
+def _create_log(r: CreateResult) -> str:
+    fill_txt = f", random_fill={r.random_fill}" if r.random_fill else ""
+    return f"create_world {r.width}x{r.height} edge={r.edge}{fill_txt} -> pop {r.population}"
+
+
+def _set_cells_text(r: SetCellsResult) -> str:
+    msg = (
+        f"Set {r.set_alive} cells alive and {r.set_dead} dead. "
+        f"Population is now {r.population}."
+    )
+    if r.skipped:
+        msg += f" Skipped {len(r.skipped)} out-of-bounds cells: {r.skipped[:10]}"
+    return msg
+
+
+def _placement_text(r: PlacementResult) -> str:
+    msg = (
+        f"Placed {r.pattern_width}x{r.pattern_height} pattern with {r.placed_cells} "
+        f"live cells at ({r.x},{r.y})..({r.x + r.pattern_width - 1},"
+        f"{r.y + r.pattern_height - 1}). Population is now {r.population}."
+    )
+    if r.skipped:
+        msg += (
+            f" {len(r.skipped)} cells fell outside the dead-edge board and were skipped."
+        )
+    return msg
+
+
+def _advance_text(r: AdvanceResult) -> str:
+    return (
+        f"Advanced {r.generations} generation{'s' if r.generations != 1 else ''} "
+        f"-> generation {r.generation}. Population {r.population_before} -> "
+        f"{r.population} ({r.population_delta:+d}). Dynamics: {r.dynamics}."
+    )
+
+
+def _rewind_text(r: RewindResult) -> str:
+    return (
+        f"Moved world from generation {r.from_generation} to {r.to_generation}. "
+        f"Population is now {r.population}. "
+        f"Dropped {r.dropped_snapshots} future snapshots from the timeline."
+    )
+
+
+def _sim_summary_text(summary: dict) -> str:
+    bits = [
+        f"gen {summary['start_generation']} -> {summary['end_generation']}",
+        f"pop {summary['final_population']}",
+    ]
+    if summary["extinct"]:
+        bits.append(f"extinct at gen {summary['extinct_at_generation']}")
+    if summary["stable"]:
+        bits.append(f"stable at gen {summary['stable_at_generation']}")
+    if summary["repeating_period"]:
+        bits.append(f"period {summary['repeating_period']}")
+    return ", ".join(bits)
+
+
+def _sim_run_json(run: SimulationRun) -> str:
+    if run.failed:
+        return json.dumps(run.error)
+    payload = {"samples": run.samples, "summary": run.summary}
+    if run.interrupted:
+        payload["interrupted"] = {
+            "at_generation": run.interrupted_at_generation,
+            "reason": "concurrent_edit",
+            "message": (
+                "Another actor (the browser, or autorun) modified the world "
+                f"mid-run, so this call stopped at generation "
+                f"{run.interrupted_at_generation} instead of completing. The "
+                "generations listed in \"samples\" are committed; \"summary\" "
+                "is null because the run did not finish. Call again to "
+                "continue from the world's current state."
+            ),
+        }
+    return json.dumps(payload)
+
+
+def _sim_interrupted_log(name: str, run: SimulationRun) -> str:
+    return (
+        f"{name} interrupted by a concurrent edit at generation "
+        f"{run.interrupted_at_generation} ({len(run.samples)} generations committed)"
+    )
+
