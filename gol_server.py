@@ -5,162 +5,81 @@ One process serves three surfaces:
   - Live state feed ws://localhost:8000/ws      (broadcasts board + events)
   - MCP endpoint    http://localhost:8000/mcp   (Streamable HTTP, for agents)
 
-The server owns the authoritative board. Every mutation — from an MCP tool
-call or the browser — broadcasts fresh state to all connected viewers.
+WorldService owns the authoritative board; this module is the transport layer
+on top of it. MCP tools and browser commands both call the same service
+methods, so there is exactly one implementation of each operation — what
+differs here is only how the result is phrased and who it is reported to.
+Every mutation broadcasts fresh state to all connected viewers.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
-import bisect
 import json
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server import MCPServer
 
-from gol_world import (
-    MAX_DIM,
-    MIN_DIM,
-    SimulationError,
-    World,
-    next_grid_of,
-    parse_rle,
-    simulate,
-    validate_sim_params,
+from world_service import (
+    AdvanceResult,
+    CreateResult,
+    PlacementResult,
+    RewindResult,
+    SetCellsResult,
+    SimulationRun,
+    StateSnapshot,
+    TimelineStatus,
+    WorldService,
+    WorldStatus,
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
-MAX_ADVANCE = 100          # per user spec: cap generations per advance() call
-MAX_OBSERVE_CELLS = 20000  # cap ASCII output size for observe_world
-MAX_FPS = 1000.0
-MIN_FPS = 1.0
-HISTORY_SNAPSHOT_INTERVAL = 10
-HISTORY_MAX_SNAPSHOTS = 2000
 
+service = WorldService()
+SOCKETS: set[WebSocket] = set()
+EVENTS: deque[dict] = deque(maxlen=200)
 
-def _pack_grid(grid: np.ndarray) -> bytes:
-    return np.packbits(grid, axis=None).tobytes()
-
-
-def _unpack_grid(packed: bytes, width: int, height: int) -> np.ndarray:
-    bits = np.unpackbits(np.frombuffer(packed, dtype=np.uint8), count=width * height)
-    return bits.reshape((height, width)).astype(np.uint8, copy=False)
-
-
-class State:
-    def __init__(self):
-        self.world = World(160, 100, edge="wrap")
-        self.lock = asyncio.Lock()
-        self.sockets: set[WebSocket] = set()
-        self.events: deque[dict] = deque(maxlen=200)
-        self.running = False
-        self.fps = 10.0
-        self.run_task: asyncio.Task | None = None
-        self.snapshot_interval = HISTORY_SNAPSHOT_INTERVAL
-        self.history_generations: list[int] = []
-        self.history_snapshots: dict[int, bytes] = {}
-        self.max_reachable_generation = 0
-        self._reset_history_locked()
-
-    def _reset_history_locked(self) -> None:
-        self.history_generations.clear()
-        self.history_snapshots.clear()
-        self.max_reachable_generation = self.world.generation
-        self._record_snapshot_locked(force=True)
-
-    def _record_snapshot_locked(self, force: bool = False) -> bool:
-        gen = self.world.generation
-        if not force and (gen % self.snapshot_interval != 0):
-            return False
-
-        if gen not in self.history_snapshots:
-            bisect.insort(self.history_generations, gen)
-        self.history_snapshots[gen] = _pack_grid(self.world.grid)
-        if gen > self.max_reachable_generation:
-            self.max_reachable_generation = gen
-
-        while len(self.history_generations) > HISTORY_MAX_SNAPSHOTS:
-            drop_gen = self.history_generations.pop(0)
-            if drop_gen == gen and self.history_generations:
-                drop_gen = self.history_generations.pop(0)
-            self.history_snapshots.pop(drop_gen, None)
-        return True
-
-    def _truncate_future_locked(self) -> int:
-        idx = bisect.bisect_right(self.history_generations, self.world.generation)
-        to_drop = self.history_generations[idx:]
-        if not to_drop:
-            return 0
-        del self.history_generations[idx:]
-        for gen in to_drop:
-            self.history_snapshots.pop(gen, None)
-        self.max_reachable_generation = self.world.generation
-        return len(to_drop)
-
-    def _timeline_bounds_locked(self) -> tuple[int, int]:
-        if not self.history_generations:
-            return self.world.generation, self.world.generation
-        return self.history_generations[0], self.history_generations[-1]
-
-    def _reconstruct_generation_locked(self, target_generation: int) -> np.ndarray:
-        idx = bisect.bisect_right(self.history_generations, target_generation) - 1
-        if idx < 0:
-            raise ValueError("target generation is older than retained history")
-
-        start_gen = self.history_generations[idx]
-        packed = self.history_snapshots[start_gen]
-        g = _unpack_grid(packed, self.world.width, self.world.height)
-        steps = target_generation - start_gen
-        for _ in range(steps):
-            g = next_grid_of(g, self.world.edge)
-        return g
-
-
-S = State()
 
 # ------------------------------------------------------------------ broadcast
 
 
 def state_message() -> dict:
-    w = S.world
-    min_gen, latest_snapshot = S._timeline_bounds_locked()
+    s: StateSnapshot = service.state_snapshot()
     return {
         "type": "state",
-        "width": w.width,
-        "height": w.height,
-        "edge": w.edge,
-        "generation": w.generation,
-        "population": w.population(),
-        "running": S.running,
-        "fps": S.fps,
-        "timeline_min_generation": min_gen,
-        "timeline_latest_snapshot": latest_snapshot,
-        "timeline_latest_generation": S.max_reachable_generation,
-        "timeline_snapshot_interval": S.snapshot_interval,
-        "timeline_snapshot_count": len(S.history_generations),
-        "cells": base64.b64encode(np.packbits(w.grid, axis=None).tobytes()).decode("ascii"),
+        "width": s.width,
+        "height": s.height,
+        "edge": s.edge,
+        "generation": s.generation,
+        "population": s.population,
+        "running": s.running,
+        "fps": s.fps,
+        "timeline_min_generation": s.timeline_min_generation,
+        "timeline_latest_snapshot": s.timeline_latest_snapshot,
+        "timeline_latest_generation": s.timeline_latest_generation,
+        "timeline_snapshot_interval": s.timeline_snapshot_interval,
+        "timeline_snapshot_count": s.timeline_snapshot_count,
+        "cells": base64.b64encode(s.packed_cells).decode("ascii"),
     }
 
 
 async def _send_all(payload: dict) -> None:
-    if not S.sockets:
+    if not SOCKETS:
         return
     text = json.dumps(payload)
     dead = []
-    for ws in list(S.sockets):
+    for ws in list(SOCKETS):
         try:
             await ws.send_text(text)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        S.sockets.discard(ws)
+        SOCKETS.discard(ws)
 
 
 async def broadcast_state() -> None:
@@ -169,68 +88,130 @@ async def broadcast_state() -> None:
 
 async def log_event(source: str, text: str) -> None:
     evt = {"type": "event", "source": source, "text": text, "ts": time.time()}
-    S.events.append(evt)
+    EVENTS.append(evt)
     await _send_all(evt)
 
 
-# -------------------------------------------------------------------- autorun
+service.set_change_listener(broadcast_state)
 
 
-async def _run_loop() -> None:
-    try:
-        while S.running:
-            t0 = time.monotonic()
-            async with S.lock:
-                S._truncate_future_locked()
-                S.world.step(1)
-                S._record_snapshot_locked()
-            await broadcast_state()
-            delay = 1.0 / S.fps - (time.monotonic() - t0)
-            await asyncio.sleep(delay if delay > 0 else 0.001)
-    finally:
-        S.running = False
-        await broadcast_state()
+# ------------------------------------------------------------- prose helpers
+# The service returns dataclasses; MCP tools return text. These turn one into
+# the other so the phrasing lives in one place per operation.
 
 
-async def set_running(running: bool, fps: float | None = None) -> None:
-    if fps is not None:
-        S.fps = min(MAX_FPS, max(MIN_FPS, float(fps)))
-    if running and not S.running:
-        S.running = True
-        S.run_task = asyncio.create_task(_run_loop())
-    elif not running:
-        S.running = False  # loop exits on its own and broadcasts
-    await broadcast_state()
+def _status_text(st: WorldStatus) -> str:
+    box_txt = (
+        f"x=[{st.bbox[0]}..{st.bbox[2]}] y=[{st.bbox[1]}..{st.bbox[3]}]"
+        if st.bbox else "none (board is empty)"
+    )
+    edge_txt = (
+        "toroidal wrap-around" if st.edge == "wrap"
+        else "cells beyond the border count as dead"
+    )
+    return (
+        f"World {st.width}x{st.height}, edge={st.edge} ({edge_txt})\n"
+        f"Generation {st.generation}, population {st.population}\n"
+        f"Live-cell bounding box: {box_txt}\n"
+        f"Dynamics: {st.dynamics}\n"
+        f"Autorun: {'ON at ' + str(st.fps) + ' fps' if st.running else 'off'}\n"
+        f"Connected browser viewers: {len(SOCKETS)}"
+    )
+
+
+def _timeline_status_text(t: TimelineStatus) -> str:
+    return (
+        f"Timeline status\n"
+        f"Current generation: {t.current_generation}\n"
+        f"Earliest retained snapshot: {t.earliest_snapshot}\n"
+        f"Latest retained snapshot: {t.latest_snapshot}\n"
+        f"Latest reachable generation: {t.max_reachable_generation}\n"
+        f"Snapshot interval target: every {t.snapshot_interval} generations\n"
+        f"Stored snapshots: {t.snapshot_count} (cap {t.snapshot_cap})\n"
+        f"Rewind range right now: [{t.earliest_snapshot}..{t.max_reachable_generation}]"
+    )
+
+
+def _create_text(r: CreateResult) -> str:
+    return (
+        f"Created {r.width}x{r.height} world (edge={r.edge}), "
+        f"generation 0, population {r.population}."
+    )
+
+
+def _create_log(r: CreateResult) -> str:
+    fill_txt = f", random_fill={r.random_fill}" if r.random_fill else ""
+    return f"create_world {r.width}x{r.height} edge={r.edge}{fill_txt} -> pop {r.population}"
+
+
+def _set_cells_text(r: SetCellsResult) -> str:
+    msg = (
+        f"Set {r.set_alive} cells alive and {r.set_dead} dead. "
+        f"Population is now {r.population}."
+    )
+    if r.skipped:
+        msg += f" Skipped {len(r.skipped)} out-of-bounds cells: {r.skipped[:10]}"
+    return msg
+
+
+def _placement_text(r: PlacementResult) -> str:
+    msg = (
+        f"Placed {r.pattern_width}x{r.pattern_height} pattern with {r.placed_cells} "
+        f"live cells at ({r.x},{r.y})..({r.x + r.pattern_width - 1},"
+        f"{r.y + r.pattern_height - 1}). Population is now {r.population}."
+    )
+    if r.skipped:
+        msg += (
+            f" {len(r.skipped)} cells fell outside the dead-edge board and were skipped."
+        )
+    return msg
+
+
+def _advance_text(r: AdvanceResult) -> str:
+    return (
+        f"Advanced {r.generations} generation{'s' if r.generations != 1 else ''} "
+        f"-> generation {r.generation}. Population {r.population_before} -> "
+        f"{r.population} ({r.population_delta:+d}). Dynamics: {r.dynamics}."
+    )
+
+
+def _rewind_text(r: RewindResult) -> str:
+    return (
+        f"Moved world from generation {r.from_generation} to {r.to_generation}. "
+        f"Population is now {r.population}. "
+        f"Dropped {r.dropped_snapshots} future snapshots from the timeline."
+    )
+
+
+def _sim_summary_text(summary: dict) -> str:
+    bits = [
+        f"gen {summary['start_generation']} -> {summary['end_generation']}",
+        f"pop {summary['final_population']}",
+    ]
+    if summary["extinct"]:
+        bits.append(f"extinct at gen {summary['extinct_at_generation']}")
+    if summary["stable"]:
+        bits.append(f"stable at gen {summary['stable_at_generation']}")
+    if summary["repeating_period"]:
+        bits.append(f"period {summary['repeating_period']}")
+    return ", ".join(bits)
+
+
+def _sim_run_json(run: SimulationRun) -> str:
+    if run.failed:
+        return json.dumps(run.error)
+    return json.dumps({"samples": run.samples, "summary": run.summary})
 
 
 async def rewind_world(target_generation: int, actor: str) -> str:
-    target = int(target_generation)
-    await set_running(False)
-    async with S.lock:
-        current = S.world.generation
-        if target < 0:
-            raise ValueError("generation must be >= 0")
-        if target > S.max_reachable_generation:
-            raise ValueError(
-                f"generation {target} is outside retained history "
-                f"(max reachable is {S.max_reachable_generation})"
-            )
-
-        grid = S._reconstruct_generation_locked(target)
-        S.world.grid = grid
-        S.world.generation = target
-        # Committing a rewind establishes a new present on a linear timeline.
-        # Any generations ahead of the target are discarded immediately.
-        dropped = S._truncate_future_locked()
-        S._record_snapshot_locked(force=True)
-        pop = S.world.population()
-
-    await broadcast_state()
-    await log_event(actor, f"rewind_to_generation({target}) -> pop {pop}, dropped {dropped} future snapshots")
-    return (
-        f"Moved world from generation {current} to {target}. Population is now {pop}. "
-        f"Dropped {dropped} future snapshots from the timeline."
+    """Shared by the MCP tool and the browser's rewind button."""
+    result = await service.rewind(target_generation)
+    await log_event(
+        actor,
+        f"rewind_to_generation({result.to_generation}) -> pop {result.population}, "
+        f"dropped {result.dropped_snapshots} future snapshots",
     )
+    return _rewind_text(result)
 
 
 # ------------------------------------------------------------------ MCP tools
@@ -246,28 +227,12 @@ mcp = MCPServer(
 )
 
 
-def _status_text() -> str:
-    w = S.world
-    box = w.bounding_box()
-    box_txt = f"x=[{box[0]}..{box[2]}] y=[{box[1]}..{box[3]}]" if box else "none (board is empty)"
-    return (
-        f"World {w.width}x{w.height}, edge={w.edge} "
-        f"({'toroidal wrap-around' if w.edge == 'wrap' else 'cells beyond the border count as dead'})\n"
-        f"Generation {w.generation}, population {w.population()}\n"
-        f"Live-cell bounding box: {box_txt}\n"
-        f"Dynamics: {w.dynamics()}\n"
-        f"Autorun: {'ON at ' + str(S.fps) + ' fps' if S.running else 'off'}\n"
-        f"Connected browser viewers: {len(S.sockets)}"
-    )
-
-
 @mcp.tool()
 async def get_world_status() -> str:
     """Get the world's dimensions, edge behavior, generation, population,
     live-cell bounding box, dynamics (empty/static/period-2/evolving), and
     autorun state. Cheap - call this to orient yourself before other tools."""
-    async with S.lock:
-        text = _status_text()
+    text = _status_text(await service.status())
     await log_event("agent", "get_world_status")
     return text
 
@@ -281,29 +246,18 @@ async def create_world(width: int, height: int, edge: str = "wrap", random_fill:
           "dead" = cells beyond the border count as permanently dead.
     random_fill: probability 0..1 that each cell starts alive (0 = empty board).
     Coordinates afterwards: (x, y), 0-indexed from the top-left."""
-    if not 0.0 <= random_fill <= 1.0:
-        raise ValueError("random_fill must be between 0 and 1")
-    async with S.lock:
-        S.world = World(width, height, edge=edge, random_fill=random_fill)
-        S._reset_history_locked()
-        pop = S.world.population()
-    await broadcast_state()
-    fill_txt = f", random_fill={random_fill}" if random_fill else ""
-    await log_event("agent", f"create_world {width}x{height} edge={edge}{fill_txt} -> pop {pop}")
-    return f"Created {width}x{height} world (edge={edge}), generation 0, population {pop}."
+    result = await service.create_world(width, height, edge=edge, random_fill=random_fill)
+    await log_event("agent", _create_log(result))
+    return _create_text(result)
 
 
 @mcp.tool()
 async def clear_world() -> str:
     """Kill every cell and reset the generation counter to 0.
     Dimensions and edge behavior are kept."""
-    async with S.lock:
-        S.world.clear()
-        S._reset_history_locked()
-        w, h = S.world.width, S.world.height
-    await broadcast_state()
+    result = await service.clear()
     await log_event("agent", "clear_world")
-    return f"Cleared: {w}x{h} board is empty, generation reset to 0."
+    return f"Cleared: {result.width}x{result.height} board is empty, generation reset to 0."
 
 
 @mcp.tool()
@@ -316,18 +270,11 @@ async def observe_world(x: int = 0, y: int = 0, width: int = 0, height: int = 0)
     Defaults (all 0) show the full board. Output is capped at 20000 cells -
     for big boards, pass a window (get_world_status's bounding box tells you
     where the live cells are)."""
-    async with S.lock:
-        w = S.world
-        vw = width if width > 0 else w.width
-        vh = height if height > 0 else w.height
-        if vw * vh > MAX_OBSERVE_CELLS:
-            raise ValueError(
-                f"requested window is {vw}x{vh} = {vw * vh} cells; max is {MAX_OBSERVE_CELLS}. "
-                "Pass a smaller width/height window."
-            )
-        view = w.ascii_view(x, y, vw, vh)
-    await log_event("agent", f"observe_world x={x} y={y} {vw}x{vh}")
-    return view
+    result = await service.observe(x, y, width, height)
+    await log_event(
+        "agent", f"observe_world x={result.x} y={result.y} {result.width}x{result.height}"
+    )
+    return result.text
 
 
 @mcp.tool()
@@ -336,23 +283,12 @@ async def set_cells(alive: list[list[int]] | None = None, dead: list[list[int]] 
     alive=[[10, 5], [11, 5], [12, 5]]. x = column from the left, y = row from
     the top, both 0-indexed. On wrap worlds out-of-range coordinates wrap
     around; on dead-edge worlds they are skipped and reported."""
-    alive = alive or []
-    dead = dead or []
-    if not alive and not dead:
-        raise ValueError("pass at least one of alive/dead as a list of [x, y] pairs")
-    async with S.lock:
-        S._truncate_future_locked()
-        n_alive, skip_a = S.world.set_cells(alive, 1)
-        n_dead, skip_d = S.world.set_cells(dead, 0)
-        S._record_snapshot_locked(force=True)
-        pop = S.world.population()
-    await broadcast_state()
-    await log_event("agent", f"set_cells +{n_alive} alive, +{n_dead} dead -> pop {pop}")
-    msg = f"Set {n_alive} cells alive and {n_dead} dead. Population is now {pop}."
-    skipped = skip_a + skip_d
-    if skipped:
-        msg += f" Skipped {len(skipped)} out-of-bounds cells: {skipped[:10]}"
-    return msg
+    result = await service.set_cells(alive, dead)
+    await log_event(
+        "agent",
+        f"set_cells +{result.set_alive} alive, +{result.set_dead} dead -> pop {result.population}",
+    )
+    return _set_cells_text(result)
 
 
 @mcp.tool()
@@ -368,25 +304,13 @@ async def place_pattern(rle: str, x: int, y: int, clear_rect: bool = False) -> s
     By default only the pattern's LIVE cells are stamped (existing cells
     elsewhere survive). Set clear_rect=true to wipe the pattern's bounding
     rectangle first, so the pattern lands on a clean area."""
-    cells, pw, ph = parse_rle(rle)
-    async with S.lock:
-        S._truncate_future_locked()
-        w = S.world
-        if clear_rect:
-            rect = [(x + dx, y + dy) for dy in range(ph) for dx in range(pw)]
-            w.set_cells(rect, 0)
-        placed, skipped = w.set_cells([(x + dx, y + dy) for dx, dy in cells], 1)
-        S._record_snapshot_locked(force=True)
-        pop = w.population()
-    await broadcast_state()
-    await log_event("agent", f"place_pattern {pw}x{ph} ({placed} cells) at ({x},{y})")
-    msg = (
-        f"Placed {pw}x{ph} pattern with {placed} live cells at ({x},{y})"
-        f"..({x + pw - 1},{y + ph - 1}). Population is now {pop}."
+    result = await service.place_pattern(rle, x, y, clear_rect=clear_rect)
+    await log_event(
+        "agent",
+        f"place_pattern {result.pattern_width}x{result.pattern_height} "
+        f"({result.placed_cells} cells) at ({result.x},{result.y})",
     )
-    if skipped:
-        msg += f" {len(skipped)} cells fell outside the dead-edge board and were skipped."
-    return msg
+    return _placement_text(result)
 
 
 @mcp.tool()
@@ -395,28 +319,13 @@ async def advance(generations: int = 1) -> str:
     Multi-generation advances are animated in the user's browser at ~100
     generations/second. Reports the population change and the board's
     dynamics afterwards (empty / static / period-2 / evolving)."""
-    n = int(generations)
-    if not 1 <= n <= MAX_ADVANCE:
-        raise ValueError(f"generations must be between 1 and {MAX_ADVANCE}")
-    async with S.lock:
-        S._truncate_future_locked()
-        pop_before = S.world.population()
-    for i in range(n):
-        async with S.lock:
-            S.world.step(1)
-            S._record_snapshot_locked(force=(i == n - 1))
-        await broadcast_state()
-        if n > 1:
-            await asyncio.sleep(0.01)  # let viewers see the animation
-    async with S.lock:
-        gen = S.world.generation
-        pop = S.world.population()
-        dyn = S.world.dynamics()
-    await log_event("agent", f"advance({n}) -> gen {gen}, pop {pop} ({dyn})")
-    return (
-        f"Advanced {n} generation{'s' if n != 1 else ''} -> generation {gen}. "
-        f"Population {pop_before} -> {pop} ({pop - pop_before:+d}). Dynamics: {dyn}."
+    result = await service.advance(generations)
+    await log_event(
+        "agent",
+        f"advance({result.generations}) -> gen {result.generation}, "
+        f"pop {result.population} ({result.dynamics})",
     )
+    return _advance_text(result)
 
 
 @mcp.tool()
@@ -425,47 +334,23 @@ async def set_autorun(enabled: bool, fps: float = 10) -> str:
     run live). fps is generations per second, clamped to 1..1000. All other
     tools keep working while it runs - observe_world to peek, set_cells to
     interfere. Remember to stop it when the show is over."""
-    await set_running(enabled, fps)
-    await log_event("agent", f"set_autorun {'ON at ' + str(S.fps) + ' fps' if enabled else 'OFF'}")
-    if enabled:
-        return f"Autorun ON at {S.fps} generations/second. The world is now evolving continuously."
-    async with S.lock:
-        return f"Autorun OFF at generation {S.world.generation}, population {S.world.population()}."
-
-
-def _sim_summary_text(summary: dict) -> str:
-    bits = [f"gen {summary['start_generation']} -> {summary['end_generation']}", f"pop {summary['final_population']}"]
-    if summary["extinct"]:
-        bits.append(f"extinct at gen {summary['extinct_at_generation']}")
-    if summary["stable"]:
-        bits.append(f"stable at gen {summary['stable_at_generation']}")
-    if summary["repeating_period"]:
-        bits.append(f"period {summary['repeating_period']}")
-    return ", ".join(bits)
-
-
-def _timeline_status_text() -> str:
-    current = S.world.generation
-    min_gen, latest_snapshot = S._timeline_bounds_locked()
-    max_gen = S.max_reachable_generation
-    return (
-        f"Timeline status\n"
-        f"Current generation: {current}\n"
-        f"Earliest retained snapshot: {min_gen}\n"
-        f"Latest retained snapshot: {latest_snapshot}\n"
-        f"Latest reachable generation: {max_gen}\n"
-        f"Snapshot interval target: every {S.snapshot_interval} generations\n"
-        f"Stored snapshots: {len(S.history_generations)} (cap {HISTORY_MAX_SNAPSHOTS})\n"
-        f"Rewind range right now: [{min_gen}..{max_gen}]"
+    result = await service.set_autorun(enabled, fps)
+    await log_event(
+        "agent", f"set_autorun {'ON at ' + str(result.fps) + ' fps' if enabled else 'OFF'}"
     )
+    if enabled:
+        return (
+            f"Autorun ON at {result.fps} generations/second. "
+            "The world is now evolving continuously."
+        )
+    return f"Autorun OFF at generation {result.generation}, population {result.population}."
 
 
 @mcp.tool()
 async def get_timeline_status() -> str:
     """Inspect rewind history: current generation, retained snapshot range,
     snapshot interval, and how many snapshots are stored."""
-    async with S.lock:
-        text = _timeline_status_text()
+    text = _timeline_status_text(await service.timeline_status())
     await log_event("agent", "get_timeline_status")
     return text
 
@@ -512,43 +397,14 @@ async def advance_generations(count: int, sample_every: int = 1) -> str:
     call it repeatedly for more). The browser keeps animating live: it's
     updated once per sample point (and thus every generation if you pick
     sample_every=1)."""
-    async with S.lock:
-        S._truncate_future_locked()
-        start_grid = S.world.grid.copy()
-        edge = S.world.edge
-        start_gen = S.world.generation
-        cell_count = S.world.width * S.world.height
-
-    try:
-        validate_sim_params(count, sample_every, cell_count)
-    except SimulationError as e:
-        return json.dumps(e.to_dict())
-
-    samples: list[dict] = []
-    it = simulate(start_grid, edge, count, sample_every, start_gen)
-    summary = None
-    while True:
-        try:
-            sample, g = next(it)
-        except StopIteration as stop:
-            summary = stop.value["summary"]
-            break
-        samples.append(sample)
-        async with S.lock:
-            S.world.grid = g
-            S.world.generation = sample["generation"]
-            S._record_snapshot_locked(force=(sample["generation"] == summary["end_generation"] if summary else False))
-        await broadcast_state()
-        await asyncio.sleep(0)
-
-    async with S.lock:
-        S._record_snapshot_locked(force=True)
-
-    await log_event(
-        "agent",
-        f"advance_generations(count={count}, sample_every={sample_every}) -> {_sim_summary_text(summary)}",
-    )
-    return json.dumps({"samples": samples, "summary": summary})
+    run = await service.advance_generations(count, sample_every)
+    if not run.failed:
+        await log_event(
+            "agent",
+            f"advance_generations(count={count}, sample_every={sample_every}) -> "
+            f"{_sim_summary_text(run.summary)}",
+        )
+    return _sim_run_json(run)
 
 
 @mcp.tool()
@@ -565,38 +421,14 @@ async def preview_generations(count: int, sample_every: int = 1) -> str:
     exactly for the same (count, sample_every) since both share the same
     simulation code. Nothing is committed: call advance_generations
     afterwards if you like what you see."""
-    async with S.lock:
-        start_grid = S.world.grid.copy()
-        edge = S.world.edge
-        start_gen = S.world.generation
-        cell_count = S.world.width * S.world.height
-
-    try:
-        validate_sim_params(count, sample_every, cell_count)
-    except SimulationError as e:
-        return json.dumps(e.to_dict())
-
-    samples: list[dict] = []
-    it = simulate(start_grid, edge, count, sample_every, start_gen)
-    summary = None
-    n = 0
-    while True:
-        try:
-            sample, _g = next(it)
-        except StopIteration as stop:
-            summary = stop.value["summary"]
-            break
-        samples.append(sample)
-        n += 1
-        if n % 25 == 0:
-            await asyncio.sleep(0)  # cooperative yield only - world is untouched
-
-    await log_event(
-        "agent",
-        f"preview_generations(count={count}, sample_every={sample_every}) -> "
-        f"(not committed) {_sim_summary_text(summary)}",
-    )
-    return json.dumps({"samples": samples, "summary": summary})
+    run = await service.preview_generations(count, sample_every)
+    if not run.failed:
+        await log_event(
+            "agent",
+            f"preview_generations(count={count}, sample_every={sample_every}) -> "
+            f"(not committed) {_sim_summary_text(run.summary)}",
+        )
+    return _sim_run_json(run)
 
 
 # --------------------------------------------------------------- FastAPI app
@@ -610,9 +442,7 @@ mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True)
 async def lifespan(app: FastAPI):
     async with mcp.session_manager.run():
         yield
-    S.running = False
-    if S.run_task:
-        S.run_task.cancel()
+    await service.shutdown()
 
 
 app = FastAPI(title="Game of Life MCP", lifespan=lifespan)
@@ -623,81 +453,57 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# ------------------------------------------------------- browser commands
+# Each branch maps a UI action onto the same service method the matching MCP
+# tool uses; only the phrasing of the activity-log line differs.
+
+
 async def _handle_ui(msg: dict) -> None:
     action = msg.get("action")
     if action == "paint":
         cells = msg.get("cells") or []
+        if not cells:
+            return          # an empty stroke was a no-op before the service
         value = 1 if msg.get("value", 1) else 0
-        async with S.lock:
-            S._truncate_future_locked()
-            S.world.set_cells(cells, value)
-            S._record_snapshot_locked(force=True)
-        await broadcast_state()
+        if value:
+            await service.set_cells(alive=cells)
+        else:
+            await service.set_cells(dead=cells)
     elif action == "play":
-        await set_running(True, msg.get("fps"))
-        await log_event("user", f"pressed play ({S.fps} fps)")
+        result = await service.set_autorun(True, msg.get("fps"))
+        await log_event("user", f"pressed play ({result.fps} fps)")
     elif action == "pause":
-        await set_running(False)
+        await service.set_autorun(False)
         await log_event("user", "pressed pause")
     elif action == "step":
-        async with S.lock:
-            S._truncate_future_locked()
-            S.world.step(1)
-            S._record_snapshot_locked(force=True)
-        await broadcast_state()
+        await service.advance(1)
     elif action == "advance":
         try:
-            n = int(msg.get("generations", 1))
-            if not 1 <= n <= MAX_ADVANCE:
-                raise ValueError(f"generations must be between 1 and {MAX_ADVANCE}")
-            async with S.lock:
-                S._truncate_future_locked()
-            for i in range(n):
-                async with S.lock:
-                    S.world.step(1)
-                    S._record_snapshot_locked(force=(i == n - 1))
-                await broadcast_state()
-                if n > 1:
-                    await asyncio.sleep(0.01)
-            await log_event("user", f"advanced {n} generations")
+            result = await service.advance(int(msg.get("generations", 1)))
+            await log_event("user", f"advanced {result.generations} generations")
         except Exception as e:
             await log_event("user", f"advance failed: {e}")
     elif action == "fps":
         fps = msg.get("fps")
         if fps:
-            S.fps = min(MAX_FPS, max(MIN_FPS, float(fps)))
-            await broadcast_state()
+            await service.set_autorun(service.running, fps)
     elif action == "clear":
-        async with S.lock:
-            S.world.clear()
-            S._reset_history_locked()
-        await broadcast_state()
+        await service.clear()
         await log_event("user", "cleared the world")
     elif action == "create":
         try:
-            width = int(msg.get("width"))
-            height = int(msg.get("height"))
-            edge = str(msg.get("edge", "wrap"))
-            random_fill = float(msg.get("random_fill", 0.0))
-            if edge not in ("wrap", "dead"):
-                raise ValueError('edge must be "wrap" or "dead"')
-            if not 0.0 <= random_fill <= 1.0:
-                raise ValueError("random_fill must be between 0 and 1")
-
-            async with S.lock:
-                S.world = World(width, height, edge=edge, random_fill=random_fill)
-                S._reset_history_locked()
-                pop = S.world.population()
-
-            await broadcast_state()
-            fill_txt = f", random_fill={random_fill}" if random_fill else ""
-            await log_event("user", f"create_world {width}x{height} edge={edge}{fill_txt} -> pop {pop}")
+            result = await service.create_world(
+                int(msg.get("width")),
+                int(msg.get("height")),
+                edge=str(msg.get("edge", "wrap")),
+                random_fill=float(msg.get("random_fill", 0.0)),
+            )
+            await log_event("user", _create_log(result))
         except Exception as e:
             await log_event("user", f"create failed: {e}")
     elif action == "rewind":
         try:
-            target = int(msg.get("generation"))
-            await rewind_world(target, actor="user")
+            await rewind_world(int(msg.get("generation")), actor="user")
         except Exception as e:
             await log_event("user", f"rewind failed: {e}")
 
@@ -712,21 +518,20 @@ async def _handle_ui_for_socket(ws: WebSocket, msg: dict) -> None:
         target = int(msg.get("generation"))
     except Exception:
         return
-    req_id = msg.get("request_id")
 
-    async with S.lock:
-        if target < 0 or target > S.max_reachable_generation:
-            return
-        g = S._reconstruct_generation_locked(target)
-        pop = int(g.sum())
-        payload = {
-            "type": "preview_state",
-            "generation": target,
-            "population": pop,
-            "cells": base64.b64encode(np.packbits(g, axis=None).tobytes()).decode("ascii"),
-        }
-        if isinstance(req_id, int):
-            payload["request_id"] = req_id
+    preview = await service.preview_generation(target)
+    if preview is None:
+        return
+
+    payload = {
+        "type": "preview_state",
+        "generation": preview.generation,
+        "population": preview.population,
+        "cells": base64.b64encode(preview.packed_cells).decode("ascii"),
+    }
+    req_id = msg.get("request_id")
+    if isinstance(req_id, int):
+        payload["request_id"] = req_id
 
     try:
         await ws.send_text(json.dumps(payload))
@@ -737,10 +542,10 @@ async def _handle_ui_for_socket(ws: WebSocket, msg: dict) -> None:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    S.sockets.add(ws)
+    SOCKETS.add(ws)
     try:
         await ws.send_text(json.dumps(state_message()))
-        await ws.send_text(json.dumps({"type": "backlog", "events": list(S.events)}))
+        await ws.send_text(json.dumps({"type": "backlog", "events": list(EVENTS)}))
         while True:
             try:
                 msg = json.loads(await ws.receive_text())
@@ -750,7 +555,7 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        S.sockets.discard(ws)
+        SOCKETS.discard(ws)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
